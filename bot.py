@@ -1,4 +1,3 @@
-import asyncio
 import sqlite3
 import os
 import calendar
@@ -1927,11 +1926,17 @@ async def process_recurring_payments():
         except Exception as e:
             print(f"Ошибка отправки пользователю {user_id}: {e}")
 
-# ---------- Запуск ----------
-async def main():
-    init_db()
-    scheduler.add_job(notify_all_users, "interval", minutes=1, id="notify_check")
-    scheduler.add_job(process_recurring_payments, "interval", minutes=30, id="recurring_check")
-    scheduler.start()
-    print("Бот запущен...")
-    await dp.start_polling(bot)
+# ---------- Функция для установки вебхука ----------
+async def setup_webhook(app_url: str):
+    """Устанавливает вебхук в Telegram."""
+    webhook_url = f"{app_url}/webhook"
+    await bot.set_webhook(
+        url=webhook_url,
+        drop_pending_updates=True  # Удаляем старые накопившиеся обновления
+    )
+    print(f"Webhook установлен на: {webhook_url}")
+
+# ---------- Функция для удаления вебхука (на случай остановки) ----------
+async def remove_webhook():
+    await bot.delete_webhook()
+    print("Webhook удалён.")
