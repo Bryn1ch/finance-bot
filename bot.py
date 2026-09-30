@@ -1,491 +1,15 @@
-import sqlite3
-import os
-import calendar
-from datetime import datetime, timedelta
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
-from aiogram.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery, FSInputFile
-)
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from openpyxl import Workbook
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
-# ---------- Конфигурация ----------
-TOKEN = os.environ.get("TELEGRAM_TOKEN")
-if not TOKEN:
-    raise RuntimeError("Не задана переменная окружения TELEGRAM_TOKEN")
-
-DB_PATH = "finance.db"
-
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
-scheduler = AsyncIOScheduler()
-
-# ---------- Дефолтные категории ----------
-DEFAULT_INCOME = ["Зарплата", "Фриланс", "Подарок", "Кэшбэк", "Инвестиции",
-                  "Корректировка", "Другое"]
-DEFAULT_EXPENSE = ["Еда", "Транспорт", "Жильё", "Развлечения", "Здоровье",
-                   "Одежда", "Связь", "Образование", "Подписки",
-                   "Корректировка", "Другое"]
-
-# ---------- БД ----------
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER, type TEXT, amount REAL,
-            category TEXT, date TEXT
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS categories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER, type TEXT, name TEXT,
-            UNIQUE(user_id, type, name)
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS debts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER, direction TEXT, person TEXT,
-            amount REAL, note TEXT, due_date TEXT,
-            status TEXT DEFAULT 'active',
-            created_at TEXT, closed_at TEXT,
-            notified INTEGER DEFAULT 0
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS budgets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER, category TEXT, amount REAL,
-            UNIQUE(user_id, category)
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS user_settings (
-            user_id INTEGER PRIMARY KEY,
-            notify_hour INTEGER DEFAULT 10,
-            notify_minute INTEGER DEFAULT 0,
-            include_debts INTEGER DEFAULT 0
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS monthly_budget (
-            user_id INTEGER PRIMARY KEY,
-            amount REAL
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS recurring (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            title TEXT,
-            amount REAL,
-            category TEXT,
-            ttype TEXT,
-            day_of_month INTEGER,
-            active INTEGER DEFAULT 1,
-            last_charged TEXT,
-            created_at TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-# ---------- Категории ----------
-def get_user_categories(user_id, ttype):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT name FROM categories WHERE user_id=? AND type=?", (user_id, ttype))
-    user_cats = [r[0] for r in cur.fetchall()]
-    defaults = DEFAULT_INCOME if ttype == "income" else DEFAULT_EXPENSE
-    all_cats = list(dict.fromkeys(user_cats + defaults))
-    cur.execute("""
-        SELECT category, COUNT(*) FROM transactions
-        WHERE user_id=? AND type=? GROUP BY category
-    """, (user_id, ttype))
-    freq = dict(cur.fetchall())
-    conn.close()
-    all_cats.sort(key=lambda c: (-freq.get(c, 0), c))
-    return all_cats
-
-def add_user_category(user_id, ttype, name):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    try:
-        cur.execute("INSERT INTO categories (user_id, type, name) VALUES (?, ?, ?)",
-                    (user_id, ttype, name))
-        conn.commit(); r = True
-    except sqlite3.IntegrityError:
-        r = False
-    conn.close(); return r
-
-def delete_user_category(user_id, ttype, name):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM categories WHERE user_id=? AND type=? AND name=?",
-                (user_id, ttype, name))
-    d = cur.rowcount
-    conn.commit(); conn.close()
-    return d > 0
-
-# ---------- Транзакции ----------
-def add_transaction(user_id, ttype, amount, category):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO transactions (user_id, type, amount, category, date) VALUES (?, ?, ?, ?, ?)",
-        (user_id, ttype, amount, category, datetime.now().strftime("%Y-%m-%d %H:%M"))
-    )
-    conn.commit(); conn.close()
-
-def get_balance(user_id, include_debts=False):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT 
-            COALESCE(SUM(CASE WHEN type='income' THEN amount ELSE 0 END), 0),
-            COALESCE(SUM(CASE WHEN type='expense' THEN amount ELSE 0 END), 0)
-        FROM transactions WHERE user_id=?
-    """, (user_id,))
-    inc, exp = cur.fetchone()
-    conn.close()
-    balance = inc - exp
-    if include_debts:
-        debts = get_active_debts(user_id)
-        lent = sum(d[3] for d in debts if d[1] == "lent")
-        borrowed = sum(d[3] for d in debts if d[1] == "borrowed")
-        balance = balance + lent - borrowed
-    return inc, exp, balance
-
-def get_stats(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT category, SUM(amount) FROM transactions
-        WHERE user_id=? AND type='expense'
-        GROUP BY category ORDER BY SUM(amount) DESC
-    """, (user_id,))
-    rows = cur.fetchall()
-    conn.close(); return rows
-
-def get_history(user_id, limit=10):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT type, amount, category, date FROM transactions
-        WHERE user_id=? ORDER BY id DESC LIMIT ?
-    """, (user_id, limit))
-    rows = cur.fetchall()
-    conn.close(); return rows
-
-def get_last_transaction(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT type, amount, category FROM transactions
-        WHERE user_id=? ORDER BY id DESC LIMIT 1
-    """, (user_id,))
-    row = cur.fetchone()
-    conn.close(); return row
-
-def get_all_transactions(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT type, amount, category, date FROM transactions
-        WHERE user_id=? ORDER BY id
-    """, (user_id,))
-    rows = cur.fetchall()
-    conn.close(); return rows
-
-def reset_user(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM transactions WHERE user_id=?", (user_id,))
-    d = cur.rowcount
-    conn.commit(); conn.close()
-    return d
-
-# ---------- Долги ----------
-def add_debt(user_id, direction, person, amount, note, due_date):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO debts (user_id, direction, person, amount, note, due_date, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (user_id, direction, person, amount, note, due_date,
-          datetime.now().strftime("%Y-%m-%d %H:%M")))
-    conn.commit(); conn.close()
-
-def get_active_debts(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, direction, person, amount, note, due_date
-        FROM debts WHERE user_id=? AND status='active'
-        ORDER BY (due_date IS NULL), due_date, id
-    """, (user_id,))
-    rows = cur.fetchall()
-    conn.close(); return rows
-
-def get_debt(debt_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, user_id, direction, person, amount, note, due_date, status
-        FROM debts WHERE id=?
-    """, (debt_id,))
-    row = cur.fetchone()
-    conn.close(); return row
-
-def close_debt(debt_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("UPDATE debts SET status='closed', closed_at=? WHERE id=?",
-                (datetime.now().strftime("%Y-%m-%d %H:%M"), debt_id))
-    conn.commit(); conn.close()
-
-def delete_debt(debt_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM debts WHERE id=?", (debt_id,))
-    conn.commit(); conn.close()
-
-# ---------- Бюджеты ----------
-def set_budget(user_id, category, amount):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO budgets (user_id, category, amount) VALUES (?, ?, ?)
-        ON CONFLICT(user_id, category) DO UPDATE SET amount=excluded.amount
-    """, (user_id, category, amount))
-    conn.commit(); conn.close()
-
-def delete_budget(user_id, category):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM budgets WHERE user_id=? AND category=?", (user_id, category))
-    conn.commit(); conn.close()
-
-def get_budgets(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT category, amount FROM budgets WHERE user_id=? ORDER BY category",
-                (user_id,))
-    rows = cur.fetchall()
-    conn.close(); return rows
-
-def get_budget(user_id, category):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT amount FROM budgets WHERE user_id=? AND category=?",
-                (user_id, category))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-def set_monthly_budget(user_id, amount):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO monthly_budget (user_id, amount) VALUES (?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET amount=excluded.amount
-    """, (user_id, amount))
-    conn.commit(); conn.close()
-
-def get_monthly_budget(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT amount FROM monthly_budget WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-def delete_monthly_budget(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM monthly_budget WHERE user_id=?", (user_id,))
-    conn.commit(); conn.close()
-
-def get_month_spent_total(user_id):
-    month_start = datetime.now().strftime("%Y-%m-01")
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT COALESCE(SUM(amount), 0) FROM transactions
-        WHERE user_id=? AND type='expense' AND date >= ?
-    """, (user_id, month_start))
-    spent = cur.fetchone()[0]
-    conn.close(); return spent
-
-def get_month_spent(user_id, category):
-    month_start = datetime.now().strftime("%Y-%m-01")
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT COALESCE(SUM(amount), 0) FROM transactions
-        WHERE user_id=? AND type='expense' AND category=? AND date >= ?
-    """, (user_id, category, month_start))
-    spent = cur.fetchone()[0]
-    conn.close(); return spent
-
-def check_budgets_after_add(user_id, category):
-    warnings = []
-    budget = get_budget(user_id, category)
-    if budget and budget > 0:
-        spent = get_month_spent(user_id, category)
-        if spent > budget:
-            warnings.append(
-                f"🚨 <b>Превышен бюджет по категории «{category}»!</b>\n"
-                f"Потрачено: <b>{spent:.2f} ₽</b> из {budget:.2f} ₽\n"
-                f"Перерасход: <b>{spent - budget:.2f} ₽</b>"
-            )
-        elif spent >= budget * 0.8:
-            warnings.append(
-                f"⚠️ <b>Бюджет по «{category}» почти исчерпан</b>\n"
-                f"Потрачено: <b>{spent:.2f} ₽</b> из {budget:.2f} ₽\n"
-                f"Осталось: <b>{budget - spent:.2f} ₽</b>"
-            )
-    mb = get_monthly_budget(user_id)
-    if mb and mb > 0:
-        total_spent = get_month_spent_total(user_id)
-        if total_spent > mb:
-            warnings.append(
-                f"🚨 <b>Превышен общий бюджет месяца!</b>\n"
-                f"Потрачено: <b>{total_spent:.2f} ₽</b> из {mb:.2f} ₽\n"
-                f"Перерасход: <b>{total_spent - mb:.2f} ₽</b>"
-            )
-        elif total_spent >= mb * 0.8:
-            warnings.append(
-                f"⚠️ <b>Общий бюджет месяца почти исчерпан</b>\n"
-                f"Потрачено: <b>{total_spent:.2f} ₽</b> из {mb:.2f} ₽\n"
-                f"Осталось: <b>{mb - total_spent:.2f} ₽</b>"
-            )
-    return "\n\n".join(warnings) if warnings else None
-
-# ---------- Настройки ----------
-def get_user_settings(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT notify_hour, notify_minute, include_debts
-        FROM user_settings WHERE user_id=?
-    """, (user_id,))
-    row = cur.fetchone()
-    if not row:
-        cur.execute("INSERT INTO user_settings (user_id) VALUES (?)", (user_id,))
-        conn.commit()
-        row = (10, 0, 0)
-    conn.close()
-    return row
-
-def update_user_settings(user_id, hour=None, minute=None, include_debts=None):
-    get_user_settings(user_id)
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    if hour is not None:
-        cur.execute("UPDATE user_settings SET notify_hour=? WHERE user_id=?", (hour, user_id))
-    if minute is not None:
-        cur.execute("UPDATE user_settings SET notify_minute=? WHERE user_id=?", (minute, user_id))
-    if include_debts is not None:
-        cur.execute("UPDATE user_settings SET include_debts=? WHERE user_id=?",
-                    (1 if include_debts else 0, user_id))
-    conn.commit(); conn.close()
-
-# ---------- Регулярные платежи ----------
-def add_recurring(user_id, title, amount, category, ttype, day_of_month):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO recurring (user_id, title, amount, category, ttype, day_of_month, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (user_id, title, amount, category, ttype, day_of_month,
-          datetime.now().strftime("%Y-%m-%d %H:%M")))
-    conn.commit(); conn.close()
-
-def get_recurring(user_id, only_active=True):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    q = "SELECT id, title, amount, category, ttype, day_of_month, active, last_charged FROM recurring WHERE user_id=?"
-    if only_active:
-        q += " AND active=1"
-    q += " ORDER BY day_of_month, id"
-    cur.execute(q, (user_id,))
-    rows = cur.fetchall()
-    conn.close(); return rows
-
-def get_recurring_item(rec_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, user_id, title, amount, category, ttype, day_of_month, active, last_charged
-        FROM recurring WHERE id=?
-    """, (rec_id,))
-    row = cur.fetchone()
-    conn.close(); return row
-
-def delete_recurring(rec_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM recurring WHERE id=?", (rec_id,))
-    conn.commit(); conn.close()
-
-def toggle_recurring(rec_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("UPDATE recurring SET active = 1 - active WHERE id=?", (rec_id,))
-    conn.commit(); conn.close()
-
-def mark_recurring_charged(rec_id, date_str):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("UPDATE recurring SET last_charged=? WHERE id=?", (date_str, rec_id))
-    conn.commit(); conn.close()
-
-def get_recurring_due():
-    now = datetime.now()
-    today_day = now.day
-    cur_month = now.strftime("%Y-%m")
-    last_day = calendar.monthrange(now.year, now.month)[1]
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, user_id, title, amount, category, ttype, day_of_month, last_charged
-        FROM recurring WHERE active=1
-    """)
-    all_rec = cur.fetchall()
-    conn.close()
-    due = []
-    for rec in all_rec:
-        rec_id, user_id, title, amount, category, ttype, day, last_charged = rec
-        eff_day = min(day, last_day)
-        if today_day != eff_day:
-            continue
-        if last_charged and last_charged.startswith(cur_month):
-            continue
-        due.append(rec)
-    return due
-
 # ---------- FSM ----------
 class AddOp(StatesGroup):
     entering_amount = State()
-
-class NewCategory(StatesGroup):
-    entering_name = State()
+    choosing_account = State()
 
 class AdjustBalance(StatesGroup):
     entering_amount = State()
+    choosing_account = State()
     confirming = State()
+
+class NewCategory(StatesGroup):
+    entering_name = State()
 
 class NewDebt(StatesGroup):
     entering_person = State()
@@ -508,21 +32,71 @@ class NewRecurring(StatesGroup):
     entering_amount = State()
     choosing_type = State()
     choosing_category = State()
+    choosing_account = State()
     entering_day = State()
+
+class NewAccount(StatesGroup):
+    entering_name = State()
+    choosing_kind = State()
+
+class Transfer(StatesGroup):
+    choosing_from = State()
+    choosing_to = State()
+    entering_amount = State()
 
 # ---------- Клавиатуры ----------
 def main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Доход", callback_data="add_income"),
          InlineKeyboardButton(text="➖ Расход", callback_data="add_expense")],
-        [InlineKeyboardButton(text="⭐ Повторить", callback_data="repeat_last"),
-         InlineKeyboardButton(text="✏️ Корректировка", callback_data="adjust_balance")],
+        [InlineKeyboardButton(text="🔄 Перевод", callback_data="transfer"),
+         InlineKeyboardButton(text="⭐ Повторить", callback_data="repeat_last")],
+        [InlineKeyboardButton(text="✏️ Корректировка", callback_data="adjust_balance")],
+        [InlineKeyboardButton(text="💳 Счета", callback_data="accounts_menu"),
+         InlineKeyboardButton(text="💵 Баланс", callback_data="balance")],
         [InlineKeyboardButton(text="🤝 Долги", callback_data="debts_menu"),
          InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
-        [InlineKeyboardButton(text="💵 Баланс", callback_data="balance"),
-         InlineKeyboardButton(text="📈 График", callback_data="chart_menu")],
-        [InlineKeyboardButton(text="📜 История", callback_data="history")],
+        [InlineKeyboardButton(text="📈 График", callback_data="chart_menu"),
+         InlineKeyboardButton(text="📜 История", callback_data="history")],
         [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings_menu")],
+    ])
+
+def accounts_kb(user_id):
+    accounts = get_accounts(user_id)
+    rows = []
+    for acc_id, name, kind in accounts:
+        bal = get_account_balance(user_id, acc_id)
+        emoji = "💳" if kind == "card" else ("💵" if kind == "cash" else "🏦")
+        label = f"{emoji} {name}: {bal:.0f} ₽"
+        rows.append([InlineKeyboardButton(text=label[:60], callback_data=f"acc_view:{acc_id}")])
+    rows.append([InlineKeyboardButton(text="➕ Добавить счёт", callback_data="acc_add")])
+    rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="back_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def account_picker_kb(user_id, prefix):
+    """prefix — например 'tx_acc' или 'tr_from', 'tr_to', 'rec_acc', 'adj_acc'."""
+    accounts = get_accounts(user_id)
+    rows = []
+    for acc_id, name, kind in accounts:
+        bal = get_account_balance(user_id, acc_id)
+        emoji = "💳" if kind == "card" else ("💵" if kind == "cash" else "🏦")
+        label = f"{emoji} {name} ({bal:.0f} ₽)"
+        rows.append([InlineKeyboardButton(text=label[:60], callback_data=f"{prefix}:{acc_id}")])
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def account_kind_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Карта", callback_data="acc_kind:card")],
+        [InlineKeyboardButton(text="💵 Наличные", callback_data="acc_kind:cash")],
+        [InlineKeyboardButton(text="🏦 Другое", callback_data="acc_kind:other")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
+    ])
+
+def account_actions_kb(acc_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Удалить счёт", callback_data=f"acc_del:{acc_id}")],
+        [InlineKeyboardButton(text="⬅️ К счетам", callback_data="accounts_menu")],
     ])
 
 def categories_kb(user_id, ttype):
@@ -747,14 +321,17 @@ def chart_menu_kb():
         [InlineKeyboardButton(text="🥧 Топ категорий (месяц)", callback_data="chart_top_cats")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")],
     ])
-
 # ---------- Handlers ----------
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     get_user_settings(message.from_user.id)
+    ensure_default_accounts(message.from_user.id)
+    total = get_total_balance(message.from_user.id)
     await message.answer(
         f"Привет, {message.from_user.first_name}! 👋\n\n"
-        "Я помогу контролировать твои средства, долги и бюджеты.",
+        f"💰 Общий баланс: <b>{total:.2f} ₽</b>\n\n"
+        "Я помогу контролировать твои средства, счета, долги и бюджеты.",
+        parse_mode="HTML",
         reply_markup=main_menu()
     )
 
@@ -765,40 +342,159 @@ async def cb_noop(call: CallbackQuery):
 @dp.callback_query(F.data == "back_menu")
 async def cb_back_menu(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    await call.message.edit_text("Главное меню:", reply_markup=main_menu())
+    total = get_total_balance(call.from_user.id)
+    await call.message.edit_text(
+        f"Главное меню\n\n💰 Общий баланс: <b>{total:.2f} ₽</b>",
+        parse_mode="HTML",
+        reply_markup=main_menu()
+    )
     await call.answer()
 
+# ---------- Счета ----------
+@dp.callback_query(F.data == "accounts_menu")
+async def cb_accounts_menu(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    items, total = get_accounts_with_balances(call.from_user.id)
+    if not items:
+        await call.message.edit_text(
+            "💳 <b>Счета</b>\n\nУ тебя пока нет счетов.",
+            parse_mode="HTML",
+            reply_markup=accounts_kb(call.from_user.id)
+        )
+        await call.answer()
+        return
+
+    text = "💳 <b>Твои счета</b>\n\n"
+    for acc_id, name, kind, bal in items:
+        emoji = "💳" if kind == "card" else ("💵" if kind == "cash" else "🏦")
+        text += f"{emoji} <b>{name}</b>: {bal:.2f} ₽\n"
+    text += f"\n━━━━━━━━━━━━━━━━\n💰 <b>Общая сумма: {total:.2f} ₽</b>"
+
+    await call.message.edit_text(text, parse_mode="HTML",
+                                 reply_markup=accounts_kb(call.from_user.id))
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("acc_view:"))
+async def cb_acc_view(call: CallbackQuery, state: FSMContext):
+    acc_id = int(call.data.split(":")[1])
+    acc = get_account(acc_id)
+    if not acc or acc[1] != call.from_user.id:
+        await call.answer("Не найдено", show_alert=True)
+        return
+    _, _, name, kind = acc
+    bal = get_account_balance(call.from_user.id, acc_id)
+    emoji = "💳" if kind == "card" else ("💵" if kind == "cash" else "🏦")
+    text = (
+        f"{emoji} <b>{name}</b>\n\n"
+        f"💰 Баланс: <b>{bal:.2f} ₽</b>"
+    )
+    await call.message.edit_text(text, parse_mode="HTML",
+                                 reply_markup=account_actions_kb(acc_id))
+    await call.answer()
+
+@dp.callback_query(F.data == "acc_add")
+async def cb_acc_add(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(NewAccount.entering_name)
+    await call.message.edit_text(
+        "➕ <b>Новый счёт</b>\n\nВведи название (например, «Сбер», «Тинькофф»):",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")]
+        ])
+    )
+    await call.answer()
+
+@dp.message(NewAccount.entering_name)
+async def process_acc_name(message: Message, state: FSMContext):
+    name = message.text.strip()
+    if not name or len(name) > 30:
+        await message.answer("❌ Некорректное название (до 30 символов).")
+        return
+    await state.update_data(acc_name=name)
+    await state.set_state(NewAccount.choosing_kind)
+    await message.answer(
+        f"Счёт «<b>{name}</b>»\n\nВыбери тип:",
+        parse_mode="HTML",
+        reply_markup=account_kind_kb()
+    )
+
+@dp.callback_query(F.data.startswith("acc_kind:"))
+async def cb_acc_kind(call: CallbackQuery, state: FSMContext):
+    kind = call.data.split(":")[1]
+    data = await state.get_data()
+    name = data.get("acc_name")
+    if not name:
+        await call.answer("Ошибка", show_alert=True)
+        return
+    ok = add_account(call.from_user.id, name, kind)
+    await state.clear()
+    if ok:
+        await call.message.edit_text(
+            f"✅ Счёт <b>{name}</b> создан!",
+            parse_mode="HTML",
+            reply_markup=accounts_kb(call.from_user.id)
+        )
+        await call.answer("Создан")
+    else:
+        await call.message.edit_text(
+            f"⚠️ Счёт <b>{name}</b> уже существует.",
+            parse_mode="HTML",
+            reply_markup=accounts_kb(call.from_user.id)
+        )
+        await call.answer()
+
+@dp.callback_query(F.data.startswith("acc_del:"))
+async def cb_acc_del(call: CallbackQuery, state: FSMContext):
+    acc_id = int(call.data.split(":")[1])
+    ok, info = delete_account(call.from_user.id, acc_id)
+    if ok:
+        await call.message.edit_text(
+            f"🗑 Счёт <b>{info}</b> удалён вместе с операциями.",
+            parse_mode="HTML",
+            reply_markup=accounts_kb(call.from_user.id)
+        )
+        await call.answer("Удалён")
+    else:
+        await call.answer(info, show_alert=True)
+
+# ---------- Баланс ----------
 @dp.callback_query(F.data == "balance")
 async def cb_balance(call: CallbackQuery, state: FSMContext):
     await state.clear()
     income, expense, _ = get_balance(call.from_user.id)
-    balance = income - expense
+    items, total = get_accounts_with_balances(call.from_user.id)
+
     debts = get_active_debts(call.from_user.id)
     lent = sum(d[3] for d in debts if d[1] == "lent")
     borrowed = sum(d[3] for d in debts if d[1] == "borrowed")
     hour, minute, include_debts = get_user_settings(call.from_user.id)
-    effective = balance + (lent - borrowed if include_debts else 0)
+
+    effective = total + (lent - borrowed if include_debts else 0)
     emoji = "🟢" if effective >= 0 else "🔴"
 
     text = (
         f"💼 <b>Твой баланс</b>\n\n"
         f"📈 Доходы: <b>{income:.2f} ₽</b>\n"
-        f"📉 Расходы: <b>{expense:.2f} ₽</b>\n"
-        f"💰 По операциям: <b>{balance:.2f} ₽</b>\n"
+        f"📉 Расходы: <b>{expense:.2f} ₽</b>\n\n"
+        f"💳 <b>По счетам:</b>\n"
     )
+    for acc_id, name, kind, bal in items:
+        em = "💳" if kind == "card" else ("💵" if kind == "cash" else "🏦")
+        text += f"{em} {name}: <b>{bal:.2f} ₽</b>\n"
+    text += f"\n💰 <b>Общая сумма: {total:.2f} ₽</b>"
+
     if lent or borrowed:
         text += (
-            f"\n🤝 <b>Долги:</b>\n"
+            f"\n\n🤝 <b>Долги:</b>\n"
             f"📤 Мне должны: <b>{lent:.2f} ₽</b>\n"
             f"📥 Я должен: <b>{borrowed:.2f} ₽</b>\n"
         )
         if include_debts:
             text += f"\n{emoji} <b>Итоговый (с долгами): {effective:.2f} ₽</b>"
         else:
-            text += (f"\n{emoji} <b>С долгами было бы: {balance + lent - borrowed:.2f} ₽</b>\n"
+            text += (f"\n{emoji} <b>С долгами было бы: {total + lent - borrowed:.2f} ₽</b>\n"
                      f"<i>Включить в ⚙️ Настройках</i>")
-    else:
-        text += f"\n{emoji} Текущий: <b>{balance:.2f} ₽</b>"
 
     mb = get_monthly_budget(call.from_user.id)
     if mb:
@@ -837,16 +533,28 @@ async def cb_history(call: CallbackQuery, state: FSMContext):
     if not rows:
         text = "📜 История пуста."
     else:
+        accounts = {a[0]: a[1] for a in get_accounts(call.from_user.id)}
         text = "📜 <b>Последние операции:</b>\n\n"
-        for ttype, amount, cat, date in rows:
-            sign = "➕" if ttype == "income" else "➖"
-            text += f"{sign} {amount:.2f} ₽ — {cat}\n<i>{date}</i>\n\n"
+        for ttype, amount, cat, date, acc_id in rows:
+            if ttype == "income":
+                sign = "➕"
+            elif ttype == "expense":
+                sign = "➖"
+            elif ttype == "transfer_in":
+                sign = "🔄⬅"
+            else:
+                sign = "🔄➡"
+            acc_name = accounts.get(acc_id, "—")
+            text += f"{sign} {amount:.2f} ₽ — {cat}\n"
+            text += f"<i>{date} · {acc_name}</i>\n\n"
     await call.message.edit_text(text, parse_mode="HTML", reply_markup=main_menu())
     await call.answer()
 
+# ---------- Добавление операции (доход/расход) ----------
 @dp.callback_query(F.data.in_({"add_income", "add_expense"}))
 async def cb_add(call: CallbackQuery, state: FSMContext):
     ttype = "income" if call.data == "add_income" else "expense"
+    ensure_default_accounts(call.from_user.id)
     await state.update_data(ttype=ttype)
     await state.set_state(AddOp.entering_amount)
     word = "дохода" if ttype == "income" else "расхода"
@@ -854,7 +562,8 @@ async def cb_add(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text(
         f"{sign} <b>Новый {'доход' if ttype == 'income' else 'расход'}</b>\n\n"
         f"Введи сумму {word}:",
-        parse_mode="HTML", reply_markup=after_amount_kb()
+        parse_mode="HTML",
+        reply_markup=after_amount_kb()
     )
     await call.answer()
 
@@ -870,28 +579,60 @@ async def process_amount(message: Message, state: FSMContext):
     data = await state.get_data()
     ttype = data["ttype"]
     await state.update_data(amount=amount)
+    await state.set_state(AddOp.choosing_account)
     await message.answer(
-        f"💰 Сумма: <b>{amount:.2f} ₽</b>\n\nВыбери категорию:",
+        f"💰 Сумма: <b>{amount:.2f} ₽</b>\n\nВыбери счёт:",
         parse_mode="HTML",
-        reply_markup=categories_kb(message.from_user.id, ttype)
+        reply_markup=account_picker_kb(message.from_user.id, "tx_acc")
     )
+
+@dp.callback_query(F.data.startswith("tx_acc:"))
+async def cb_tx_account(call: CallbackQuery, state: FSMContext):
+    acc_id = int(call.data.split(":")[1])
+    data = await state.get_data()
+    ttype = data.get("ttype")
+    amount = data.get("amount")
+    if amount is None:
+        await call.answer("⚠️ Сначала введи сумму", show_alert=True)
+        return
+    await state.update_data(account_id=acc_id)
+    acc = get_account(acc_id)
+    acc_name = acc[2] if acc else "—"
+    await call.message.edit_text(
+        f"💰 <b>{amount:.2f} ₽</b>\n"
+        f"🏦 Счёт: <b>{acc_name}</b>\n\nВыбери категорию:",
+        parse_mode="HTML",
+        reply_markup=categories_kb(call.from_user.id, ttype)
+    )
+    await call.answer()
 
 @dp.callback_query(F.data.startswith("cat:"))
 async def cb_category(call: CallbackQuery, state: FSMContext):
     _, ttype, category = call.data.split(":", 2)
     data = await state.get_data()
     amount = data.get("amount")
-    if amount is None:
-        await call.answer("⚠️ Сначала введи сумму", show_alert=True)
+    acc_id = data.get("account_id")
+    if amount is None or acc_id is None:
+        await call.answer("⚠️ Данные потеряны, начни заново", show_alert=True)
+        await state.clear()
         return
-    add_transaction(call.from_user.id, ttype, amount, category)
+    add_transaction(call.from_user.id, acc_id, ttype, amount, category)
     await state.clear()
+
+    acc = get_account(acc_id)
+    acc_name = acc[2] if acc else "—"
     sign = "➕" if ttype == "income" else "➖"
-    text = f"✅ <b>Записано!</b>\n\n{sign} {amount:.2f} ₽ — <b>{category}</b>"
+    text = (f"✅ <b>Записано!</b>\n\n"
+            f"{sign} {amount:.2f} ₽ — <b>{category}</b>\n"
+            f"🏦 {acc_name}")
+
     if ttype == "expense":
         warning = check_budgets_after_add(call.from_user.id, category)
         if warning:
             text += f"\n\n{warning}"
+
+    total = get_total_balance(call.from_user.id)
+    text += f"\n\n💰 Общий баланс: <b>{total:.2f} ₽</b>"
     await call.message.edit_text(text, parse_mode="HTML", reply_markup=main_menu())
     await call.answer("Сохранено!")
 
@@ -902,28 +643,119 @@ async def cb_repeat_last(call: CallbackQuery, state: FSMContext):
     if not last:
         await call.answer("Пока нет операций для повтора", show_alert=True)
         return
-    ttype, amount, category = last
-    add_transaction(call.from_user.id, ttype, amount, category)
+    ttype, amount, category, acc_id = last
+    if ttype in ("transfer_in", "transfer_out"):
+        await call.answer("Переводы не повторяются", show_alert=True)
+        return
+    if not acc_id:
+        acc_id = ensure_default_accounts(call.from_user.id)
+    add_transaction(call.from_user.id, acc_id, ttype, amount, category)
+    acc = get_account(acc_id)
+    acc_name = acc[2] if acc else "—"
     sign = "➕" if ttype == "income" else "➖"
-    text = f"⭐ <b>Повторено!</b>\n\n{sign} {amount:.2f} ₽ — <b>{category}</b>"
+    text = (f"⭐ <b>Повторено!</b>\n\n"
+            f"{sign} {amount:.2f} ₽ — <b>{category}</b>\n"
+            f"🏦 {acc_name}")
     if ttype == "expense":
         warning = check_budgets_after_add(call.from_user.id, category)
         if warning:
             text += f"\n\n{warning}"
+    total = get_total_balance(call.from_user.id)
+    text += f"\n\n💰 Общий баланс: <b>{total:.2f} ₽</b>"
     await call.message.edit_text(text, parse_mode="HTML", reply_markup=main_menu())
     await call.answer("Сохранено!")
 
+# ---------- Переводы между счетами ----------
+@dp.callback_query(F.data == "transfer")
+async def cb_transfer(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    ensure_default_accounts(call.from_user.id)
+    await state.set_state(Transfer.choosing_from)
+    await call.message.edit_text(
+        "🔄 <b>Перевод между счетами</b>\n\nОткуда списать?",
+        parse_mode="HTML",
+        reply_markup=account_picker_kb(call.from_user.id, "tr_from")
+    )
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("tr_from:"))
+async def cb_transfer_from(call: CallbackQuery, state: FSMContext):
+    acc_id = int(call.data.split(":")[1])
+    await state.update_data(from_acc=acc_id)
+    await state.set_state(Transfer.choosing_to)
+    await call.message.edit_text(
+        "🔄 Куда зачислить?",
+        reply_markup=account_picker_kb(call.from_user.id, "tr_to")
+    )
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("tr_to:"))
+async def cb_transfer_to(call: CallbackQuery, state: FSMContext):
+    acc_id = int(call.data.split(":")[1])
+    data = await state.get_data()
+    from_acc = data.get("from_acc")
+    if from_acc == acc_id:
+        await call.answer("Нельзя перевести на тот же счёт", show_alert=True)
+        return
+    await state.update_data(to_acc=acc_id)
+    await state.set_state(Transfer.entering_amount)
+    from_a = get_account(from_acc)
+    to_a = get_account(acc_id)
+    await call.message.edit_text(
+        f"🔄 <b>Перевод</b>\n\n"
+        f"Откуда: <b>{from_a[2] if from_a else '—'}</b>\n"
+        f"Куда: <b>{to_a[2] if to_a else '—'}</b>\n\n"
+        f"Введи сумму перевода:",
+        parse_mode="HTML",
+        reply_markup=after_amount_kb()
+    )
+    await call.answer()
+
+@dp.message(Transfer.entering_amount)
+async def process_transfer_amount(message: Message, state: FSMContext):
+    try:
+        amount = float(message.text.replace(",", "."))
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введи положительное число.")
+        return
+    data = await state.get_data()
+    from_acc = data["from_acc"]
+    to_acc = data["to_acc"]
+    user_id = message.from_user.id
+
+    add_transaction(user_id, from_acc, "transfer_out", amount, "Перевод")
+    add_transaction(user_id, to_acc, "transfer_in", amount, "Перевод")
+    await state.clear()
+
+    from_a = get_account(from_acc)
+    to_a = get_account(to_acc)
+    total = get_total_balance(user_id)
+    await message.answer(
+        f"✅ <b>Перевод выполнен!</b>\n\n"
+        f"🔄 {amount:.2f} ₽\n"
+        f"Из: <b>{from_a[2] if from_a else '—'}</b>\n"
+        f"В: <b>{to_a[2] if to_a else '—'}</b>\n\n"
+        f"💰 Общий баланс: <b>{total:.2f} ₽</b>",
+        parse_mode="HTML",
+        reply_markup=main_menu()
+    )
+
+# ---------- Корректировка ----------
 @dp.callback_query(F.data == "adjust_balance")
 async def cb_adjust(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    income, expense, _ = get_balance(call.from_user.id)
-    balance = income - expense
+    ensure_default_accounts(call.from_user.id)
+    total = get_total_balance(call.from_user.id)
     await state.set_state(AdjustBalance.entering_amount)
     await call.message.edit_text(
         f"✏️ <b>Корректировка баланса</b>\n\n"
-        f"Текущий баланс: <b>{balance:.2f} ₽</b>\n\n"
-        f"Введи <b>фактическую</b> сумму на счету.",
-        parse_mode="HTML", reply_markup=after_amount_kb()
+        f"Общий баланс: <b>{total:.2f} ₽</b>\n\n"
+        f"Введи <b>фактическую</b> сумму, которая должна быть на счету,\n"
+        f"к которому будем применять корректировку.",
+        parse_mode="HTML",
+        reply_markup=after_amount_kb()
     )
     await call.answer()
 
@@ -934,43 +766,74 @@ async def process_adjust_amount(message: Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ Введи корректное число.")
         return
-    income, expense, _ = get_balance(message.from_user.id)
-    current = income - expense
+    await state.update_data(target=target)
+    await state.set_state(AdjustBalance.choosing_account)
+    await message.answer(
+        f"К какому счёту применить корректировку до <b>{target:.2f} ₽</b>?",
+        parse_mode="HTML",
+        reply_markup=account_picker_kb(message.from_user.id, "adj_acc")
+    )
+
+@dp.callback_query(F.data.startswith("adj_acc:"))
+async def cb_adjust_account(call: CallbackQuery, state: FSMContext):
+    acc_id = int(call.data.split(":")[1])
+    data = await state.get_data()
+    target = data.get("target")
+    if target is None:
+        await call.answer("Ошибка", show_alert=True)
+        return
+    current = get_account_balance(call.from_user.id, acc_id)
     diff = target - current
-    await state.update_data(target=target, diff=diff)
+    await state.update_data(account_id=acc_id, diff=diff, current=current)
     await state.set_state(AdjustBalance.confirming)
+    acc = get_account(acc_id)
+    acc_name = acc[2] if acc else "—"
+
     if abs(diff) < 0.01:
         await state.clear()
-        await message.answer("✅ Баланс уже совпадает.", reply_markup=main_menu())
+        await call.message.edit_text(
+            f"✅ Баланс счёта <b>{acc_name}</b> уже совпадает с {target:.2f} ₽.",
+            parse_mode="HTML",
+            reply_markup=main_menu()
+        )
+        await call.answer()
         return
+
     sign = "➕" if diff > 0 else "➖"
     action = "доход" if diff > 0 else "расход"
-    await message.answer(
-        f"✏️ <b>Проверь</b>\n\n"
+    await call.message.edit_text(
+        f"✏️ <b>Проверь корректировку</b>\n\n"
+        f"🏦 Счёт: <b>{acc_name}</b>\n"
         f"Текущий: <b>{current:.2f} ₽</b>\n"
         f"Целевой: <b>{target:.2f} ₽</b>\n"
         f"Разница: {sign} <b>{abs(diff):.2f} ₽</b>\n\n"
-        f"Будет создан <i>{action}</i> на <b>{abs(diff):.2f} ₽</b>.\nПрименить?",
-        parse_mode="HTML", reply_markup=adjust_confirm_kb()
+        f"Будет создан <i>{action}</i> на <b>{abs(diff):.2f} ₽</b>.",
+        parse_mode="HTML",
+        reply_markup=adjust_confirm_kb()
     )
+    await call.answer()
 
 @dp.callback_query(F.data == "adjust_yes")
 async def cb_adjust_yes(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     diff = data.get("diff")
-    if diff is None:
-        await call.answer("⚠️ Нет данных", show_alert=True)
+    acc_id = data.get("account_id")
+    if diff is None or acc_id is None:
+        await call.answer("Нет данных", show_alert=True)
         return
     ttype = "income" if diff > 0 else "expense"
-    add_transaction(call.from_user.id, ttype, abs(diff), "Корректировка")
+    add_transaction(call.from_user.id, acc_id, ttype, abs(diff), "Корректировка")
     await state.clear()
-    income, expense, _ = get_balance(call.from_user.id)
+    total = get_total_balance(call.from_user.id)
     await call.message.edit_text(
-        f"✅ <b>Скорректировано!</b>\n\n💼 Баланс: <b>{income - expense:.2f} ₽</b>",
-        parse_mode="HTML", reply_markup=main_menu()
+        f"✅ <b>Скорректировано!</b>\n\n"
+        f"💰 Общий баланс: <b>{total:.2f} ₽</b>",
+        parse_mode="HTML",
+        reply_markup=main_menu()
     )
     await call.answer("Готово")
 
+# ---------- Долги ----------
 @dp.callback_query(F.data == "debts_menu")
 async def cb_debts_menu(call: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -991,7 +854,8 @@ async def cb_debts_list(call: CallbackQuery, state: FSMContext):
     debts = get_active_debts(call.from_user.id)
     if not debts:
         await call.message.edit_text("📋 Активных долгов нет.", reply_markup=debts_menu_kb())
-        await call.answer(); return
+        await call.answer()
+        return
     rows = []
     for debt_id, direction, person, amount, note, due in debts:
         emoji = "📤" if direction == "lent" else "📥"
@@ -1012,7 +876,8 @@ async def cb_debt_view(call: CallbackQuery, state: FSMContext):
     debt_id = int(call.data.split(":")[1])
     d = get_debt(debt_id)
     if not d or d[1] != call.from_user.id:
-        await call.answer("Не найдено", show_alert=True); return
+        await call.answer("Не найдено", show_alert=True)
+        return
     _, _, direction, person, amount, note, due, status = d
     emoji = "📤 Я дал в долг" if direction == "lent" else "📥 Я взял в долг"
     text = f"{emoji}\n\n👤 <b>{person}</b>\n💰 Сумма: <b>{amount:.2f} ₽</b>\n"
@@ -1029,7 +894,8 @@ async def cb_debt_close(call: CallbackQuery, state: FSMContext):
     debt_id = int(call.data.split(":")[1])
     d = get_debt(debt_id)
     if not d or d[1] != call.from_user.id:
-        await call.answer("Не найдено", show_alert=True); return
+        await call.answer("Не найдено", show_alert=True)
+        return
     close_debt(debt_id)
     await call.message.edit_text("✅ Долг закрыт!", reply_markup=debts_menu_kb())
     await call.answer("Закрыт")
@@ -1039,7 +905,8 @@ async def cb_debt_del(call: CallbackQuery, state: FSMContext):
     debt_id = int(call.data.split(":")[1])
     d = get_debt(debt_id)
     if not d or d[1] != call.from_user.id:
-        await call.answer("Не найдено", show_alert=True); return
+        await call.answer("Не найдено", show_alert=True)
+        return
     delete_debt(debt_id)
     await call.message.edit_text("🗑 Долг удалён.", reply_markup=debts_menu_kb())
     await call.answer("Удалён")
@@ -1064,7 +931,8 @@ async def cb_debt_dir(call: CallbackQuery, state: FSMContext):
 async def process_debt_person(message: Message, state: FSMContext):
     name = message.text.strip()
     if not name or len(name) > 50:
-        await message.answer("❌ Некорректное имя."); return
+        await message.answer("❌ Некорректное имя.")
+        return
     await state.update_data(person=name)
     await state.set_state(NewDebt.entering_amount)
     await message.answer("💰 Введи сумму долга:")
@@ -1076,7 +944,8 @@ async def process_debt_amount(message: Message, state: FSMContext):
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введи положительное число."); return
+        await message.answer("❌ Введи положительное число.")
+        return
     await state.update_data(amount=amount)
     await state.set_state(NewDebt.entering_note)
     await message.answer("📝 Добавь заметку:", reply_markup=debt_note_kb())
@@ -1113,7 +982,7 @@ async def cb_debt_due(call: CallbackQuery, state: FSMContext):
     )
     await call.answer("Сохранено")
 
-# ----- Графики -----
+# ---------- Графики ----------
 def _month_range(n=6):
     now = datetime.now()
     months = []
@@ -1122,7 +991,8 @@ def _month_range(n=6):
         months.append(f"{y:04d}-{m:02d}")
         m -= 1
         if m == 0:
-            m = 12; y -= 1
+            m = 12
+            y -= 1
     return list(reversed(months))
 
 def _get_monthly_expenses(user_id, months):
@@ -1136,7 +1006,8 @@ def _get_monthly_expenses(user_id, months):
     for ym, total in cur.fetchall():
         if ym in result:
             result[ym] = total
-    conn.close(); return result
+    conn.close()
+    return result
 
 def _get_monthly_income_expense(user_id, months):
     conn = sqlite3.connect(DB_PATH)
@@ -1152,9 +1023,10 @@ def _get_monthly_income_expense(user_id, months):
             continue
         if ttype == "income":
             inc[ym] = total
-        else:
+        elif ttype == "expense":
             exp[ym] = total
-    conn.close(); return inc, exp
+    conn.close()
+    return inc, exp
 
 def _plot_monthly_expenses(user_id, path):
     months = _month_range(6)
@@ -1170,7 +1042,9 @@ def _plot_monthly_expenses(user_id, path):
         if v > 0:
             ax.text(b.get_x() + b.get_width()/2, v, f"{v:.0f}",
                     ha="center", va="bottom", fontsize=9)
-    plt.tight_layout(); fig.savefig(path, dpi=120); plt.close(fig)
+    plt.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
 
 def _plot_income_vs_expense(user_id, path):
     months = _month_range(6)
@@ -1178,14 +1052,20 @@ def _plot_income_vs_expense(user_id, path):
     labels = [f"{m[5:]}.{m[2:4]}" for m in months]
     inc_v = [inc[m] for m in months]
     exp_v = [exp[m] for m in months]
-    x = range(len(labels)); w = 0.4
+    x = range(len(labels))
+    w = 0.4
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.bar([i - w/2 for i in x], inc_v, w, label="Доходы", color="#3FBF6F")
     ax.bar([i + w/2 for i in x], exp_v, w, label="Расходы", color="#E4572E")
-    ax.set_xticks(list(x)); ax.set_xticklabels(labels)
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(labels)
     ax.set_title("Доходы vs Расходы", fontsize=14, fontweight="bold")
-    ax.set_ylabel("₽"); ax.legend(); ax.grid(axis="y", alpha=0.3)
-    plt.tight_layout(); fig.savefig(path, dpi=120); plt.close(fig)
+    ax.set_ylabel("₽")
+    ax.legend()
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
 
 def _plot_top_categories(user_id, path):
     month_start = datetime.now().strftime("%Y-%m-01")
@@ -1211,7 +1091,9 @@ def _plot_top_categories(user_id, path):
                startangle=90, textprops={"fontsize": 10})
         ax.set_title("Топ категорий расходов за месяц",
                      fontsize=14, fontweight="bold")
-    plt.tight_layout(); fig.savefig(path, dpi=120); plt.close(fig)
+    plt.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
 
 @dp.callback_query(F.data == "chart_menu")
 async def cb_chart_menu(call: CallbackQuery, state: FSMContext):
@@ -1235,7 +1117,8 @@ async def cb_chart(call: CallbackQuery, state: FSMContext):
             _plot_top_categories(call.from_user.id, path)
             caption = "🥧 Топ категорий за месяц"
         else:
-            await call.answer("Неизвестный тип", show_alert=True); return
+            await call.answer("Неизвестный тип", show_alert=True)
+            return
         await call.message.answer_photo(FSInputFile(path), caption=caption)
     except Exception as e:
         await call.answer(f"Ошибка: {e}", show_alert=True)
@@ -1295,7 +1178,8 @@ async def process_hour(message: Message, state: FSMContext):
         if not 0 <= h <= 23:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введи число от 0 до 23."); return
+        await message.answer("❌ Введи число от 0 до 23.")
+        return
     await state.update_data(hour=h)
     await state.set_state(NotifySettings.entering_minute)
     await message.answer("Введи минуты (0-59):")
@@ -1307,7 +1191,8 @@ async def process_minute(message: Message, state: FSMContext):
         if not 0 <= m <= 59:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введи число от 0 до 59."); return
+        await message.answer("❌ Введи число от 0 до 59.")
+        return
     data = await state.get_data()
     update_user_settings(message.from_user.id, hour=data["hour"], minute=m)
     await state.clear()
@@ -1322,6 +1207,7 @@ async def cb_toggle_debts(call: CallbackQuery, state: FSMContext):
     update_user_settings(call.from_user.id, include_debts=not include_debts)
     await cb_settings_menu(call, state)
 
+# ---------- Категории ----------
 @dp.callback_query(F.data == "manage_cats")
 async def cb_manage_cats(call: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -1349,7 +1235,8 @@ async def process_newcat_name(message: Message, state: FSMContext):
     ttype = data["newcat_type"]
     name = message.text.strip()
     if not name or len(name) > 30:
-        await message.answer("❌ Некорректное название."); return
+        await message.answer("❌ Некорректное название.")
+        return
     added = add_user_category(message.from_user.id, ttype, name)
     await state.clear()
     msg = f"✅ Категория <b>{name}</b> добавлена!" if added else "⚠️ Уже существует."
@@ -1368,7 +1255,8 @@ async def cb_delcat_type(call: CallbackQuery, state: FSMContext):
     if not kb:
         await call.message.edit_text("Нет пользовательских категорий.",
                                      reply_markup=manage_cats_kb())
-        await call.answer(); return
+        await call.answer()
+        return
     await call.message.edit_text("Выбери категорию:", reply_markup=kb)
     await call.answer()
 
@@ -1383,6 +1271,7 @@ async def cb_delcat(call: CallbackQuery, state: FSMContext):
     else:
         await call.answer("Не удалось", show_alert=True)
 
+# ---------- Бюджеты ----------
 @dp.callback_query(F.data == "budgets_menu")
 async def cb_budgets_menu(call: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -1454,7 +1343,8 @@ async def process_budget_amount(message: Message, state: FSMContext):
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введи положительное число."); return
+        await message.answer("❌ Введи положительное число.")
+        return
     data = await state.get_data()
     category = data["budget_cat"]
     set_budget(message.from_user.id, category, amount)
@@ -1469,7 +1359,8 @@ async def cb_budget_del(call: CallbackQuery, state: FSMContext):
     kb = budget_del_kb(call.from_user.id)
     if not kb:
         await call.message.edit_text("Нет бюджетов.", reply_markup=budgets_menu_kb())
-        await call.answer(); return
+        await call.answer()
+        return
     await call.message.edit_text("Выбери для удаления:", reply_markup=kb)
     await call.answer()
 
@@ -1518,7 +1409,8 @@ async def process_monthly_budget_amount(message: Message, state: FSMContext):
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введи положительное число."); return
+        await message.answer("❌ Введи положительное число.")
+        return
     set_monthly_budget(message.from_user.id, amount)
     await state.clear()
     await message.answer(
@@ -1533,6 +1425,7 @@ async def cb_monthly_budget_del(call: CallbackQuery, state: FSMContext):
                                  reply_markup=budgets_menu_kb())
     await call.answer("Удалено")
 
+# ---------- Регулярные платежи ----------
 @dp.callback_query(F.data == "recurring_menu")
 async def cb_recurring_menu(call: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -1555,9 +1448,11 @@ async def cb_recurring_list(call: CallbackQuery, state: FSMContext):
     if not items:
         await call.message.edit_text("📋 Платежей пока нет.",
                                      reply_markup=recurring_menu_kb())
-        await call.answer(); return
+        await call.answer()
+        return
     rows = []
-    for rec_id, title, amount, category, ttype, day, active, last in items:
+    for rec in items:
+        rec_id, title, amount, category, ttype, day, active, last, acc_id = rec
         emoji = "➖" if ttype == "expense" else "➕"
         status = "" if active else " ⏸"
         label = f"{emoji} {title[:15]} — {amount:.0f} ₽ ({day}ч){status}"
@@ -1575,14 +1470,18 @@ async def cb_rec_view(call: CallbackQuery, state: FSMContext):
     rec_id = int(call.data.split(":")[1])
     r = get_recurring_item(rec_id)
     if not r or r[1] != call.from_user.id:
-        await call.answer("Не найдено", show_alert=True); return
-    _, _, title, amount, category, ttype, day, active, last = r
+        await call.answer("Не найдено", show_alert=True)
+        return
+    _, _, title, amount, category, ttype, day, active, last, acc_id = r
+    acc = get_account(acc_id) if acc_id else None
+    acc_name = acc[2] if acc else "—"
     emoji = "➖ Расход" if ttype == "expense" else "➕ Доход"
     text = (
         f"🧾 <b>{title}</b>\n\n"
         f"{emoji}\n"
         f"💰 Сумма: <b>{amount:.2f} ₽</b>\n"
         f"🏷 Категория: <b>{category}</b>\n"
+        f"🏦 Счёт: <b>{acc_name}</b>\n"
         f"📅 День месяца: <b>{day}</b>\n"
         f"📌 Статус: <b>{'активен' if active else 'приостановлен'}</b>\n"
     )
@@ -1597,7 +1496,8 @@ async def cb_rec_toggle(call: CallbackQuery, state: FSMContext):
     rec_id = int(call.data.split(":")[1])
     r = get_recurring_item(rec_id)
     if not r or r[1] != call.from_user.id:
-        await call.answer("Не найдено", show_alert=True); return
+        await call.answer("Не найдено", show_alert=True)
+        return
     toggle_recurring(rec_id)
     await cb_rec_view(call, state)
 
@@ -1606,7 +1506,8 @@ async def cb_rec_del(call: CallbackQuery, state: FSMContext):
     rec_id = int(call.data.split(":")[1])
     r = get_recurring_item(rec_id)
     if not r or r[1] != call.from_user.id:
-        await call.answer("Не найдено", show_alert=True); return
+        await call.answer("Не найдено", show_alert=True)
+        return
     delete_recurring(rec_id)
     await call.message.edit_text("🗑 Платёж удалён.", reply_markup=recurring_menu_kb())
     await call.answer("Удалён")
@@ -1614,9 +1515,10 @@ async def cb_rec_del(call: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "recurring_add")
 async def cb_recurring_add(call: CallbackQuery, state: FSMContext):
     await state.clear()
+    ensure_default_accounts(call.from_user.id)
     await state.set_state(NewRecurring.entering_title)
     await call.message.edit_text(
-        "🧾 <b>Новый платёж</b>\n\nШаг 1/5: Введи название (например, <i>Аренда</i>, <i>Netflix</i>):",
+        "🧾 <b>Новый платёж</b>\n\nШаг 1/6: Введи название:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")]
@@ -1628,10 +1530,11 @@ async def cb_recurring_add(call: CallbackQuery, state: FSMContext):
 async def process_rec_title(message: Message, state: FSMContext):
     title = message.text.strip()
     if not title or len(title) > 40:
-        await message.answer("❌ Некорректное название (до 40 символов)."); return
+        await message.answer("❌ Некорректное название (до 40 символов).")
+        return
     await state.update_data(rec_title=title)
     await state.set_state(NewRecurring.entering_amount)
-    await message.answer("Шаг 2/5: Введи сумму:")
+    await message.answer("Шаг 2/6: Введи сумму:")
 
 @dp.message(NewRecurring.entering_amount)
 async def process_rec_amount(message: Message, state: FSMContext):
@@ -1640,10 +1543,11 @@ async def process_rec_amount(message: Message, state: FSMContext):
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введи положительное число."); return
+        await message.answer("❌ Введи положительное число.")
+        return
     await state.update_data(rec_amount=amount)
     await state.set_state(NewRecurring.choosing_type)
-    await message.answer("Шаг 3/5: Тип платежа:", reply_markup=recurring_type_kb())
+    await message.answer("Шаг 3/6: Тип платежа:", reply_markup=recurring_type_kb())
 
 @dp.callback_query(F.data.startswith("rec_type:"))
 async def cb_rec_type(call: CallbackQuery, state: FSMContext):
@@ -1651,7 +1555,7 @@ async def cb_rec_type(call: CallbackQuery, state: FSMContext):
     await state.update_data(rec_type=ttype)
     await state.set_state(NewRecurring.choosing_category)
     await call.message.edit_text(
-        "Шаг 4/5: Категория:",
+        "Шаг 4/6: Категория:",
         reply_markup=categories_kb_rec(call.from_user.id, ttype)
     )
     await call.answer()
@@ -1660,9 +1564,20 @@ async def cb_rec_type(call: CallbackQuery, state: FSMContext):
 async def cb_rec_cat(call: CallbackQuery, state: FSMContext):
     category = call.data.split(":", 1)[1]
     await state.update_data(rec_category=category)
+    await state.set_state(NewRecurring.choosing_account)
+    await call.message.edit_text(
+        "Шаг 5/6: Счёт, с которого списывать:",
+        reply_markup=account_picker_kb(call.from_user.id, "rec_acc")
+    )
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("rec_acc:"))
+async def cb_rec_acc(call: CallbackQuery, state: FSMContext):
+    acc_id = int(call.data.split(":")[1])
+    await state.update_data(rec_account=acc_id)
     await state.set_state(NewRecurring.entering_day)
     await call.message.edit_text(
-        "Шаг 5/5: День месяца для списания:",
+        "Шаг 6/6: День месяца для списания:",
         reply_markup=recurring_day_kb()
     )
     await call.answer()
@@ -1689,13 +1604,14 @@ async def process_rec_day(message: Message, state: FSMContext):
         if not 1 <= day <= 31:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введи число от 1 до 31."); return
+        await message.answer("❌ Введи число от 1 до 31.")
+        return
     await _finish_recurring_msg(message, state, day)
 
 async def _finish_recurring(call: CallbackQuery, state: FSMContext, day: int):
     data = await state.get_data()
     add_recurring(call.from_user.id, data["rec_title"], data["rec_amount"],
-                  data["rec_category"], data["rec_type"], day)
+                  data["rec_category"], data["rec_type"], data["rec_account"], day)
     await state.clear()
     emoji = "➖" if data["rec_type"] == "expense" else "➕"
     await call.message.edit_text(
@@ -1710,7 +1626,7 @@ async def _finish_recurring(call: CallbackQuery, state: FSMContext, day: int):
 async def _finish_recurring_msg(message: Message, state: FSMContext, day: int):
     data = await state.get_data()
     add_recurring(message.from_user.id, data["rec_title"], data["rec_amount"],
-                  data["rec_category"], data["rec_type"], day)
+                  data["rec_category"], data["rec_type"], data["rec_account"], day)
     await state.clear()
     emoji = "➖" if data["rec_type"] == "expense" else "➕"
     await message.answer(
@@ -1721,73 +1637,95 @@ async def _finish_recurring_msg(message: Message, state: FSMContext, day: int):
         parse_mode="HTML", reply_markup=recurring_menu_kb()
     )
 
+# ---------- Экспорт ----------
 @dp.callback_query(F.data == "export_excel")
 async def cb_export(call: CallbackQuery, state: FSMContext):
     await state.clear()
     rows = get_all_transactions(call.from_user.id)
     if not rows:
-        await call.answer("Нет данных", show_alert=True); return
+        await call.answer("Нет данных", show_alert=True)
+        return
+    accounts = {a[0]: a[1] for a in get_accounts(call.from_user.id)}
+
     wb = Workbook()
     ws = wb.active
     ws.title = "Операции"
-    ws.append(["Дата", "Тип", "Сумма (₽)", "Категория"])
+    ws.append(["Дата", "Тип", "Сумма (₽)", "Категория", "Счёт", "Заметка"])
     for c in ws[1]:
         c.font = c.font.copy(bold=True)
-    for ttype, amount, cat, date in rows:
-        ws.append([date, "Доход" if ttype == "income" else "Расход", amount, cat])
+    for ttype, amount, cat, date, acc_id, note in rows:
+        type_str = {"income": "Доход", "expense": "Расход",
+                    "transfer_in": "Перевод (вход)",
+                    "transfer_out": "Перевод (выход)"}.get(ttype, ttype)
+        ws.append([date, type_str, amount, cat,
+                   accounts.get(acc_id, "—"), note or ""])
     for col in ws.columns:
         max_len = max((len(str(c.value)) for c in col if c.value), default=10)
         ws.column_dimensions[col[0].column_letter].width = max_len + 3
 
-    ws2 = wb.create_sheet("Долги")
-    ws2.append(["Направление", "Кому", "Сумма (₽)", "Заметка", "Срок", "Статус"])
+    ws2 = wb.create_sheet("Счета")
+    ws2.append(["Счёт", "Тип", "Баланс (₽)"])
     for c in ws2[1]:
+        c.font = c.font.copy(bold=True)
+    items, total = get_accounts_with_balances(call.from_user.id)
+    for acc_id, name, kind, bal in items:
+        ws2.append([name, {"card": "Карта", "cash": "Наличные"}.get(kind, "Другое"), bal])
+    ws2.append([])
+    ws2.append(["", "Общая сумма:", total])
+    for col in ws2.columns:
+        max_len = max((len(str(c.value)) for c in col if c.value), default=10)
+        ws2.column_dimensions[col[0].column_letter].width = max_len + 3
+
+    ws3 = wb.create_sheet("Долги")
+    ws3.append(["Направление", "Кому", "Сумма (₽)", "Заметка", "Срок", "Статус"])
+    for c in ws3[1]:
         c.font = c.font.copy(bold=True)
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""SELECT direction, person, amount, note, due_date, status
         FROM debts WHERE user_id=? ORDER BY id""", (call.from_user.id,))
     for direction, person, amount, note, due, status in cur.fetchall():
-        ws2.append(["Я дал" if direction == "lent" else "Я взял",
+        ws3.append(["Я дал" if direction == "lent" else "Я взял",
                     person, amount, note or "", due or "",
                     "активен" if status == "active" else "закрыт"])
     conn.close()
-    for col in ws2.columns:
-        max_len = max((len(str(c.value)) for c in col if c.value), default=10)
-        ws2.column_dimensions[col[0].column_letter].width = max_len + 3
-
-    ws3 = wb.create_sheet("Бюджеты")
-    ws3.append(["Тип", "Категория", "Лимит/мес (₽)", "Потрачено (₽)", "Остаток (₽)"])
-    for c in ws3[1]:
-        c.font = c.font.copy(bold=True)
-    mb = get_monthly_budget(call.from_user.id)
-    if mb:
-        spent_total = get_month_spent_total(call.from_user.id)
-        ws3.append(["Общий", "—", mb, spent_total, mb - spent_total])
-    for cat, amount in get_budgets(call.from_user.id):
-        spent = get_month_spent(call.from_user.id, cat)
-        ws3.append(["Категория", cat, amount, spent, amount - spent])
     for col in ws3.columns:
         max_len = max((len(str(c.value)) for c in col if c.value), default=10)
         ws3.column_dimensions[col[0].column_letter].width = max_len + 3
 
-    ws4 = wb.create_sheet("Регулярные")
-    ws4.append(["Название", "Тип", "Сумма (₽)", "Категория", "День месяца", "Статус"])
+    ws4 = wb.create_sheet("Бюджеты")
+    ws4.append(["Тип", "Категория", "Лимит/мес (₽)", "Потрачено (₽)", "Остаток (₽)"])
     for c in ws4[1]:
         c.font = c.font.copy(bold=True)
-    for rec in get_recurring(call.from_user.id, only_active=False):
-        rec_id, title, amount, category, ttype, day, active, last = rec
-        ws4.append([title, "Расход" if ttype == "expense" else "Доход",
-                    amount, category, day, "активен" if active else "приостановлен"])
+    mb = get_monthly_budget(call.from_user.id)
+    if mb:
+        spent_total = get_month_spent_total(call.from_user.id)
+        ws4.append(["Общий", "—", mb, spent_total, mb - spent_total])
+    for cat, amount in get_budgets(call.from_user.id):
+        spent = get_month_spent(call.from_user.id, cat)
+        ws4.append(["Категория", cat, amount, spent, amount - spent])
     for col in ws4.columns:
         max_len = max((len(str(c.value)) for c in col if c.value), default=10)
         ws4.column_dimensions[col[0].column_letter].width = max_len + 3
+
+    ws5 = wb.create_sheet("Регулярные")
+    ws5.append(["Название", "Тип", "Сумма (₽)", "Категория", "Счёт", "День", "Статус"])
+    for c in ws5[1]:
+        c.font = c.font.copy(bold=True)
+    for rec in get_recurring(call.from_user.id, only_active=False):
+        rec_id, title, amount, category, ttype, day, active, last, acc_id = rec
+        ws5.append([title, "Расход" if ttype == "expense" else "Доход",
+                    amount, category, accounts.get(acc_id, "—"),
+                    day, "активен" if active else "приостановлен"])
+    for col in ws5.columns:
+        max_len = max((len(str(c.value)) for c in col if c.value), default=10)
+        ws5.column_dimensions[col[0].column_letter].width = max_len + 3
 
     ws.append([])
     income, expense, _ = get_balance(call.from_user.id)
     ws.append(["", "", "Итого доходов:", income])
     ws.append(["", "", "Итого расходов:", expense])
-    ws.append(["", "", "Баланс:", income - expense])
+    ws.append(["", "", "Общий баланс:", total])
 
     filename = f"finance_{call.from_user.id}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
     wb.save(filename)
@@ -1798,6 +1736,7 @@ async def cb_export(call: CallbackQuery, state: FSMContext):
         pass
     await call.answer("Готово!")
 
+# ---------- Сброс ----------
 @dp.callback_query(F.data == "reset_confirm")
 async def cb_reset_confirm(call: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -1809,11 +1748,12 @@ async def cb_reset_confirm(call: CallbackQuery, state: FSMContext):
     conn.close()
     await call.message.edit_text(
         "⚠️ <b>Полный сброс</b>\n\n"
-        f"Будет удалено <b>{count}</b> операций.\n"
+        f"Будет удалено <b>{count}</b> операций по всем счетам.\n"
         f"📈 Доходы: {income:.2f} ₽\n"
         f"📉 Расходы: {expense:.2f} ₽\n\n"
         "❗ Действие необратимо.\n"
-        "Для мягкой правки баланса используй <b>✏️ Корректировку</b>.",
+        "Счета и категории останутся.\n"
+        "Для мягкой правки используй <b>✏️ Корректировку</b>.",
         parse_mode="HTML", reply_markup=confirm_reset_kb()
     )
     await call.answer()
@@ -1834,6 +1774,7 @@ async def cb_reset_no(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text("✅ Отменено.", reply_markup=settings_menu_kb(call.from_user.id))
     await call.answer()
 
+# ---------- Отмена ----------
 @dp.callback_query(F.data == "cancel")
 async def cb_cancel(call: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -1877,7 +1818,8 @@ async def check_debts_for_user(user_id):
             conn = sqlite3.connect(DB_PATH)
             cur = conn.cursor()
             cur.execute("UPDATE debts SET notified=1 WHERE id=?", (debt_id,))
-            conn.commit(); conn.close()
+            conn.commit()
+            conn.close()
             count += 1
         except Exception as e:
             print(f"Не отправить user {user_id}: {e}")
@@ -1902,15 +1844,20 @@ async def process_recurring_payments():
         return
     due = get_recurring_due()
     for rec in due:
-        rec_id, user_id, title, amount, category, ttype, day, last = rec
-        add_transaction(user_id, ttype, amount, category)
+        rec_id, user_id, title, amount, category, ttype, day, last, acc_id = rec
+        if not acc_id:
+            acc_id = ensure_default_accounts(user_id)
+        add_transaction(user_id, acc_id, ttype, amount, category)
         today_str = now.strftime("%Y-%m-%d")
         mark_recurring_charged(rec_id, today_str)
 
+        acc = get_account(acc_id)
+        acc_name = acc[2] if acc else "—"
         sign = "➕" if ttype == "income" else "➖"
         text = (f"🧾 <b>Автосписание</b>\n\n"
                 f"<b>{title}</b>\n"
                 f"{sign} {amount:.2f} ₽ — {category}\n"
+                f"🏦 {acc_name}\n"
                 f"📅 {today_str}")
 
         if ttype == "expense":
@@ -1928,15 +1875,10 @@ async def process_recurring_payments():
 
 # ---------- Функция для установки вебхука ----------
 async def setup_webhook(app_url: str):
-    """Устанавливает вебхук в Telegram."""
     webhook_url = f"{app_url}/webhook"
-    await bot.set_webhook(
-        url=webhook_url,
-        drop_pending_updates=True  # Удаляем старые накопившиеся обновления
-    )
+    await bot.set_webhook(url=webhook_url, drop_pending_updates=True)
     print(f"Webhook установлен на: {webhook_url}")
 
-# ---------- Функция для удаления вебхука (на случай остановки) ----------
 async def remove_webhook():
     await bot.delete_webhook()
     print("Webhook удалён.")
