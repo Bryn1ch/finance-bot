@@ -1,3 +1,680 @@
+import asyncio
+import sqlite3
+import os
+import calendar
+from datetime import datetime, timedelta
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.types import (
+    Message, InlineKeyboardMarkup, InlineKeyboardButton,
+    CallbackQuery, FSInputFile
+)
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from openpyxl import Workbook
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# ---------- Конфигурация ----------
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
+if not TOKEN:
+    raise RuntimeError("Не задана переменная окружения TELEGRAM_TOKEN")
+
+DB_PATH = "finance.db"
+
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+scheduler = AsyncIOScheduler()
+
+# ---------- Дефолтные категории ----------
+DEFAULT_INCOME = ["Зарплата", "Фриланс", "Подарок", "Кэшбэк", "Инвестиции",
+                  "Корректировка", "Другое"]
+DEFAULT_EXPENSE = ["Еда", "Транспорт", "Жильё", "Развлечения", "Здоровье",
+                   "Одежда", "Связь", "Образование", "Подписки",
+                   "Корректировка", "Другое"]
+
+# ---------- Дефолтные счета ----------
+DEFAULT_ACCOUNTS = [
+    ("💳 Карта", "card"),
+    ("💵 Наличные", "cash"),
+]
+
+# ---------- Инициализация БД ----------
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            name TEXT,
+            kind TEXT,                 -- 'card' | 'cash' | 'other'
+            created_at TEXT,
+            UNIQUE(user_id, name)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            account_id INTEGER,        -- к какому счёту относится
+            type TEXT,                 -- 'income' | 'expense' | 'transfer_in' | 'transfer_out'
+            amount REAL,
+            category TEXT,
+            date TEXT,
+            note TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER, type TEXT, name TEXT,
+            UNIQUE(user_id, type, name)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS debts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER, direction TEXT, person TEXT,
+            amount REAL, note TEXT, due_date TEXT,
+            status TEXT DEFAULT 'active',
+            created_at TEXT, closed_at TEXT,
+            notified INTEGER DEFAULT 0
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS budgets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER, category TEXT, amount REAL,
+            UNIQUE(user_id, category)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id INTEGER PRIMARY KEY,
+            notify_hour INTEGER DEFAULT 10,
+            notify_minute INTEGER DEFAULT 0,
+            include_debts INTEGER DEFAULT 0
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS monthly_budget (
+            user_id INTEGER PRIMARY KEY,
+            amount REAL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS recurring (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            title TEXT,
+            amount REAL,
+            category TEXT,
+            ttype TEXT,
+            account_id INTEGER,
+            day_of_month INTEGER,
+            active INTEGER DEFAULT 1,
+            last_charged TEXT,
+            created_at TEXT
+        )
+    """)
+
+    # ---- Миграции (если таблицы старые) ----
+    cur.execute("PRAGMA table_info(transactions)")
+    tx_cols = [r[1] for r in cur.fetchall()]
+    if "account_id" not in tx_cols:
+        cur.execute("ALTER TABLE transactions ADD COLUMN account_id INTEGER")
+    if "note" not in tx_cols:
+        cur.execute("ALTER TABLE transactions ADD COLUMN note TEXT")
+
+    cur.execute("PRAGMA table_info(recurring)")
+    rec_cols = [r[1] for r in cur.fetchall()]
+    if "account_id" not in rec_cols:
+        cur.execute("ALTER TABLE recurring ADD COLUMN account_id INTEGER")
+
+    conn.commit()
+    conn.close()
+
+def ensure_default_accounts(user_id):
+    """Создаёт дефолтные счета у пользователя, если их нет. Возвращает id 'Основной' счёта."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM accounts WHERE user_id=?", (user_id,))
+    count = cur.fetchone()[0]
+    if count == 0:
+        for name, kind in DEFAULT_ACCOUNTS:
+            try:
+                cur.execute(
+                    "INSERT INTO accounts (user_id, name, kind, created_at) VALUES (?, ?, ?, ?)",
+                    (user_id, name, kind, datetime.now().strftime("%Y-%m-%d %H:%M"))
+                )
+            except sqlite3.IntegrityError:
+                pass
+        conn.commit()
+    cur.execute("SELECT id FROM accounts WHERE user_id=? ORDER BY id LIMIT 1", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+# ---------- Счета ----------
+def get_accounts(user_id):
+    """Список кортежей: (id, name, kind)."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, name, kind FROM accounts
+        WHERE user_id=? ORDER BY id
+    """, (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def get_account(account_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT id, user_id, name, kind FROM accounts WHERE id=?", (account_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+def add_account(user_id, name, kind="other"):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO accounts (user_id, name, kind, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, name, kind, datetime.now().strftime("%Y-%m-%d %H:%M"))
+        )
+        conn.commit()
+        r = True
+    except sqlite3.IntegrityError:
+        r = False
+    conn.close()
+    return r
+
+def delete_account(user_id, account_id):
+    """Удаляет счёт и связанные транзакции. Нельзя удалить последний."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM accounts WHERE user_id=?", (user_id,))
+    count = cur.fetchone()[0]
+    if count <= 1:
+        conn.close()
+        return False, "Нельзя удалить последний счёт"
+    cur.execute("SELECT name FROM accounts WHERE id=? AND user_id=?", (account_id, user_id))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return False, "Счёт не найден"
+    cur.execute("DELETE FROM transactions WHERE user_id=? AND account_id=?", (user_id, account_id))
+    cur.execute("DELETE FROM accounts WHERE id=? AND user_id=?", (account_id, user_id))
+    conn.commit()
+    conn.close()
+    return True, row[0]
+
+def get_account_balance(user_id, account_id):
+    """Баланс конкретного счёта."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT 
+            COALESCE(SUM(CASE WHEN type IN ('income','transfer_in') THEN amount ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN type IN ('expense','transfer_out') THEN amount ELSE 0 END), 0)
+        FROM transactions
+        WHERE user_id=? AND account_id=?
+    """, (user_id, account_id))
+    inc, exp = cur.fetchone()
+    conn.close()
+    return inc - exp
+
+def get_accounts_with_balances(user_id):
+    """Список: [(id, name, kind, balance)]. Плюс итог."""
+    accounts = get_accounts(user_id)
+    result = []
+    total = 0.0
+    for acc_id, name, kind in accounts:
+        bal = get_account_balance(user_id, acc_id)
+        result.append((acc_id, name, kind, bal))
+        total += bal
+    return result, total
+
+def get_total_balance(user_id):
+    """Общая сумма по всем счетам."""
+    accounts = get_accounts(user_id)
+    total = 0.0
+    for acc_id, _, _ in accounts:
+        total += get_account_balance(user_id, acc_id)
+    return total
+
+# ---------- Транзакции ----------
+def add_transaction(user_id, account_id, ttype, amount, category, note=""):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO transactions
+            (user_id, account_id, type, amount, category, date, note)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (user_id, account_id, ttype, amount, category,
+          datetime.now().strftime("%Y-%m-%d %H:%M"), note))
+    conn.commit()
+    conn.close()
+
+def get_balance(user_id, include_debts=False):
+    """Общий баланс по всем счетам + разбивка."""
+    income, expense = 0.0, 0.0
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT 
+            COALESCE(SUM(CASE WHEN type='income' THEN amount ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN type='expense' THEN amount ELSE 0 END), 0)
+        FROM transactions WHERE user_id=?
+    """, (user_id,))
+    income, expense = cur.fetchone()
+    conn.close()
+    balance = get_total_balance(user_id)
+    if include_debts:
+        debts = get_active_debts(user_id)
+        lent = sum(d[3] for d in debts if d[1] == "lent")
+        borrowed = sum(d[3] for d in debts if d[1] == "borrowed")
+        balance = balance + lent - borrowed
+    return income, expense, balance
+
+def get_stats(user_id, account_id=None):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    if account_id:
+        cur.execute("""
+            SELECT category, SUM(amount) FROM transactions
+            WHERE user_id=? AND type='expense' AND account_id=?
+            GROUP BY category ORDER BY SUM(amount) DESC
+        """, (user_id, account_id))
+    else:
+        cur.execute("""
+            SELECT category, SUM(amount) FROM transactions
+            WHERE user_id=? AND type='expense'
+            GROUP BY category ORDER BY SUM(amount) DESC
+        """, (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def get_history(user_id, limit=10, account_id=None):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    if account_id:
+        cur.execute("""
+            SELECT type, amount, category, date, account_id FROM transactions
+            WHERE user_id=? AND account_id=? ORDER BY id DESC LIMIT ?
+        """, (user_id, account_id, limit))
+    else:
+        cur.execute("""
+            SELECT type, amount, category, date, account_id FROM transactions
+            WHERE user_id=? ORDER BY id DESC LIMIT ?
+        """, (user_id, limit))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def get_last_transaction(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT type, amount, category, account_id FROM transactions
+        WHERE user_id=? ORDER BY id DESC LIMIT 1
+    """, (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+def get_all_transactions(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT type, amount, category, date, account_id, note FROM transactions
+        WHERE user_id=? ORDER BY id
+    """, (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def reset_user(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM transactions WHERE user_id=?", (user_id,))
+    d = cur.rowcount
+    conn.commit()
+    conn.close()
+    return d
+
+# ---------- Категории ----------
+def get_user_categories(user_id, ttype):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM categories WHERE user_id=? AND type=?", (user_id, ttype))
+    user_cats = [r[0] for r in cur.fetchall()]
+    defaults = DEFAULT_INCOME if ttype == "income" else DEFAULT_EXPENSE
+    all_cats = list(dict.fromkeys(user_cats + defaults))
+    cur.execute("""
+        SELECT category, COUNT(*) FROM transactions
+        WHERE user_id=? AND type=? GROUP BY category
+    """, (user_id, ttype))
+    freq = dict(cur.fetchall())
+    conn.close()
+    all_cats.sort(key=lambda c: (-freq.get(c, 0), c))
+    return all_cats
+
+def add_user_category(user_id, ttype, name):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO categories (user_id, type, name) VALUES (?, ?, ?)",
+                    (user_id, ttype, name))
+        conn.commit()
+        r = True
+    except sqlite3.IntegrityError:
+        r = False
+    conn.close()
+    return r
+
+def delete_user_category(user_id, ttype, name):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM categories WHERE user_id=? AND type=? AND name=?",
+                (user_id, ttype, name))
+    d = cur.rowcount
+    conn.commit()
+    conn.close()
+    return d > 0
+
+# ---------- Долги ----------
+def add_debt(user_id, direction, person, amount, note, due_date):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO debts (user_id, direction, person, amount, note, due_date, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (user_id, direction, person, amount, note, due_date,
+          datetime.now().strftime("%Y-%m-%d %H:%M")))
+    conn.commit()
+    conn.close()
+
+def get_active_debts(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, direction, person, amount, note, due_date
+        FROM debts WHERE user_id=? AND status='active'
+        ORDER BY (due_date IS NULL), due_date, id
+    """, (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def get_debt(debt_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, user_id, direction, person, amount, note, due_date, status
+        FROM debts WHERE id=?
+    """, (debt_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+def close_debt(debt_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("UPDATE debts SET status='closed', closed_at=? WHERE id=?",
+                (datetime.now().strftime("%Y-%m-%d %H:%M"), debt_id))
+    conn.commit()
+    conn.close()
+
+def delete_debt(debt_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM debts WHERE id=?", (debt_id,))
+    conn.commit()
+    conn.close()
+
+# ---------- Бюджеты ----------
+def set_budget(user_id, category, amount):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO budgets (user_id, category, amount) VALUES (?, ?, ?)
+        ON CONFLICT(user_id, category) DO UPDATE SET amount=excluded.amount
+    """, (user_id, category, amount))
+    conn.commit()
+    conn.close()
+
+def delete_budget(user_id, category):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM budgets WHERE user_id=? AND category=?", (user_id, category))
+    conn.commit()
+    conn.close()
+
+def get_budgets(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT category, amount FROM budgets WHERE user_id=? ORDER BY category",
+                (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def get_budget(user_id, category):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT amount FROM budgets WHERE user_id=? AND category=?",
+                (user_id, category))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def set_monthly_budget(user_id, amount):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO monthly_budget (user_id, amount) VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET amount=excluded.amount
+    """, (user_id, amount))
+    conn.commit()
+    conn.close()
+
+def get_monthly_budget(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT amount FROM monthly_budget WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def delete_monthly_budget(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM monthly_budget WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def get_month_spent_total(user_id):
+    month_start = datetime.now().strftime("%Y-%m-01")
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COALESCE(SUM(amount), 0) FROM transactions
+        WHERE user_id=? AND type='expense' AND date >= ?
+    """, (user_id, month_start))
+    spent = cur.fetchone()[0]
+    conn.close()
+    return spent
+
+def get_month_spent(user_id, category):
+    month_start = datetime.now().strftime("%Y-%m-01")
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COALESCE(SUM(amount), 0) FROM transactions
+        WHERE user_id=? AND type='expense' AND category=? AND date >= ?
+    """, (user_id, category, month_start))
+    spent = cur.fetchone()[0]
+    conn.close()
+    return spent
+
+def check_budgets_after_add(user_id, category):
+    warnings = []
+    budget = get_budget(user_id, category)
+    if budget and budget > 0:
+        spent = get_month_spent(user_id, category)
+        if spent > budget:
+            warnings.append(
+                f"🚨 <b>Превышен бюджет по категории «{category}»!</b>\n"
+                f"Потрачено: <b>{spent:.2f} ₽</b> из {budget:.2f} ₽\n"
+                f"Перерасход: <b>{spent - budget:.2f} ₽</b>"
+            )
+        elif spent >= budget * 0.8:
+            warnings.append(
+                f"⚠️ <b>Бюджет по «{category}» почти исчерпан</b>\n"
+                f"Потрачено: <b>{spent:.2f} ₽</b> из {budget:.2f} ₽\n"
+                f"Осталось: <b>{budget - spent:.2f} ₽</b>"
+            )
+    mb = get_monthly_budget(user_id)
+    if mb and mb > 0:
+        total_spent = get_month_spent_total(user_id)
+        if total_spent > mb:
+            warnings.append(
+                f"🚨 <b>Превышен общий бюджет месяца!</b>\n"
+                f"Потрачено: <b>{total_spent:.2f} ₽</b> из {mb:.2f} ₽\n"
+                f"Перерасход: <b>{total_spent - mb:.2f} ₽</b>"
+            )
+        elif total_spent >= mb * 0.8:
+            warnings.append(
+                f"⚠️ <b>Общий бюджет месяца почти исчерпан</b>\n"
+                f"Потрачено: <b>{total_spent:.2f} ₽</b> из {mb:.2f} ₽\n"
+                f"Осталось: <b>{mb - total_spent:.2f} ₽</b>"
+            )
+    return "\n\n".join(warnings) if warnings else None
+
+# ---------- Настройки ----------
+def get_user_settings(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT notify_hour, notify_minute, include_debts
+        FROM user_settings WHERE user_id=?
+    """, (user_id,))
+    row = cur.fetchone()
+    if not row:
+        cur.execute("INSERT INTO user_settings (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+        row = (10, 0, 0)
+    conn.close()
+    return row
+
+def update_user_settings(user_id, hour=None, minute=None, include_debts=None):
+    get_user_settings(user_id)
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    if hour is not None:
+        cur.execute("UPDATE user_settings SET notify_hour=? WHERE user_id=?", (hour, user_id))
+    if minute is not None:
+        cur.execute("UPDATE user_settings SET notify_minute=? WHERE user_id=?", (minute, user_id))
+    if include_debts is not None:
+        cur.execute("UPDATE user_settings SET include_debts=? WHERE user_id=?",
+                    (1 if include_debts else 0, user_id))
+    conn.commit()
+    conn.close()
+
+# ---------- Регулярные платежи ----------
+def add_recurring(user_id, title, amount, category, ttype, account_id, day_of_month):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO recurring
+            (user_id, title, amount, category, ttype, account_id, day_of_month, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (user_id, title, amount, category, ttype, account_id, day_of_month,
+          datetime.now().strftime("%Y-%m-%d %H:%M")))
+    conn.commit()
+    conn.close()
+
+def get_recurring(user_id, only_active=True):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    q = """
+        SELECT id, title, amount, category, ttype, day_of_month, active,
+               last_charged, account_id
+        FROM recurring WHERE user_id=?
+    """
+    if only_active:
+        q += " AND active=1"
+    q += " ORDER BY day_of_month, id"
+    cur.execute(q, (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def get_recurring_item(rec_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, user_id, title, amount, category, ttype, day_of_month,
+               active, last_charged, account_id
+        FROM recurring WHERE id=?
+    """, (rec_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+def delete_recurring(rec_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM recurring WHERE id=?", (rec_id,))
+    conn.commit()
+    conn.close()
+
+def toggle_recurring(rec_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("UPDATE recurring SET active = 1 - active WHERE id=?", (rec_id,))
+    conn.commit()
+    conn.close()
+
+def mark_recurring_charged(rec_id, date_str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("UPDATE recurring SET last_charged=? WHERE id=?", (date_str, rec_id))
+    conn.commit()
+    conn.close()
+
+def get_recurring_due():
+    now = datetime.now()
+    today_day = now.day
+    cur_month = now.strftime("%Y-%m")
+    last_day = calendar.monthrange(now.year, now.month)[1]
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, user_id, title, amount, category, ttype, day_of_month,
+               last_charged, account_id
+        FROM recurring WHERE active=1
+    """)
+    all_rec = cur.fetchall()
+    conn.close()
+    due = []
+    for rec in all_rec:
+        rec_id, user_id, title, amount, category, ttype, day, last_charged, acc_id = rec
+        eff_day = min(day, last_day)
+        if today_day != eff_day:
+            continue
+        if last_charged and last_charged.startswith(cur_month):
+            continue
+        due.append(rec)
+    return due
 # ---------- FSM ----------
 class AddOp(StatesGroup):
     entering_amount = State()
